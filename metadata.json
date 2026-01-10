@@ -1,0 +1,5 @@
+{
+  "name": "MD3 Music",
+  "description": "A Material Design 3 inspired local music player. Supports folder selection, looping, shuffling, and dynamic theming.",
+  "requestFramePermissions": []
+}
