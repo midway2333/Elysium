@@ -1,9 +1,11 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react';
 import { Song, PlaybackMode, ThemeColors, DEFAULT_THEME_COLOR, PlaybackLog, AppSettings } from './types';
 import { generateTheme, generateDarkTheme } from './utils/theme';
 import { formatTime } from './utils/format';
 import { loadHistory, addLog, filterLogsByRange, calculateStats, formatDuration, TimeRange, StatsResult } from './utils/stats';
 import { getMetadata } from './utils/metadata';
+import { saveSongsToDB, loadSongsFromDB, updateSongInDB } from './utils/db';
+import { MediaSession } from '@jofr/capacitor-media-session';
 import { 
   PlayIcon, PauseIcon, SkipNextIcon, SkipPrevIcon, 
   ShuffleIcon, RepeatIcon, RepeatOneIcon, FolderOpenIcon, 
@@ -17,7 +19,7 @@ const translations = {
   en: {
     title: "Elysium",
     noMusic: "No music selected",
-    hint: "Tap the folder icon to select a folder containing music files.",
+    hint: "Tap the folder icon to select music files.", 
     songs: "songs",
     choose: "Choose a song",
     unknown: "Unknown Artist",
@@ -60,12 +62,13 @@ const translations = {
     aboutApp: "About Elysium",
     developer: "Developer",
     basedOn: "Implementation",
-    links: "Links"
+    links: "Links",
+    loading: "Loading library..."
   },
   zh: {
     title: "Elysium",
     noMusic: "未选择音乐",
-    hint: "点击文件夹图标选择包含音乐文件的文件夹",
+    hint: "点击文件夹图标选择音乐文件",
     songs: "首歌曲",
     choose: "选择一首歌曲",
     unknown: "未知艺术家",
@@ -108,80 +111,390 @@ const translations = {
     aboutApp: "关于 Elysium",
     developer: "开发",
     basedOn: "技术实现",
-    links: "链接"
+    links: "链接",
+    loading: "正在加载曲库..."
   }
+};
+
+// Helper for hex to rgba conversion
+const hexToRgba = (hex: string, alpha: number) => {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result
+    ? `rgba(${parseInt(result[1], 16)}, ${parseInt(result[2], 16)}, ${parseInt(result[3], 16)}, ${alpha})`
+    : hex;
 };
 
 type ViewState = 'main' | 'settings' | 'stats' | 'info';
 
+// --- Reusable Components ---
+
+// Swipeable Panel Logic Hook
+const useSwipeDismiss = (isOpen: boolean, onClose: () => void, threshold = 100) => {
+    const [offset, setOffset] = useState(0);
+    const [isDragging, setIsDragging] = useState(false);
+    const touchStart = useRef(0);
+
+    useEffect(() => {
+        if(!isOpen) setOffset(0);
+    }, [isOpen]);
+
+    const onTouchStart = (e: React.TouchEvent) => {
+        touchStart.current = e.touches[0].clientX;
+        setIsDragging(true);
+    };
+
+    const onTouchMove = (e: React.TouchEvent) => {
+        if (!isOpen) return;
+        const diff = e.touches[0].clientX - touchStart.current;
+        // Only allow dragging to the right (positive diff)
+        if (diff > 0) {
+            setOffset(diff);
+        }
+    };
+
+    const onTouchEnd = (e: React.TouchEvent) => {
+        if (!isOpen) return;
+        setIsDragging(false);
+        const diff = e.changedTouches[0].clientX - touchStart.current;
+        if (diff > threshold) {
+            onClose();
+            setOffset(0); 
+        } else {
+            setOffset(0); // Bounce back
+        }
+    };
+    
+    return { offset, isDragging, handlers: { onTouchStart, onTouchMove, onTouchEnd }};
+}
+
+const SlideOverPanel = ({ 
+    isOpen, 
+    onClose, 
+    children, 
+    theme,
+    title,
+    zIndex = 40
+}: { 
+    isOpen: boolean, 
+    onClose: () => void, 
+    children: React.ReactNode, 
+    theme: ThemeColors,
+    title: React.ReactNode,
+    zIndex?: number
+}) => {
+    const { offset, isDragging, handlers } = useSwipeDismiss(isOpen, onClose);
+
+    return (
+        <div 
+            className={`absolute inset-0 flex flex-col bg-white shadow-2xl overflow-hidden`}
+            style={{ 
+                backgroundColor: theme.background,
+                transform: isOpen 
+                    ? `translateX(${offset}px)` 
+                    : 'translateX(100%)',
+                transition: isDragging ? 'none' : 'transform 300ms cubic-bezier(0.2, 0.0, 0, 1.0)',
+                zIndex: zIndex
+            }}
+            {...handlers}
+        >
+             <div className="h-16 flex items-center px-4 gap-4 shrink-0 shadow-sm relative z-10" style={{ backgroundColor: theme.surface }}>
+                  <button onClick={onClose} className="p-2 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}><ArrowBackIcon /></button>
+                  <h1 className="text-xl font-medium" style={{color: theme.onSurface}}>{title}</h1>
+             </div>
+             <div className="flex-1 overflow-y-auto">
+                {children}
+             </div>
+        </div>
+    );
+};
+
+// Memoized Song Item
+const SongListItem = React.memo(({ 
+    song, 
+    isActive, 
+    isPlaying, 
+    theme, 
+    onClick 
+}: { 
+    song: Song, 
+    isActive: boolean, 
+    isPlaying: boolean, 
+    theme: ThemeColors, 
+    onClick: () => void 
+}) => {
+    return (
+        <div
+        onClick={onClick}
+        className={`flex items-center p-3 rounded-2xl cursor-pointer transition-colors duration-200 group`}
+        style={{ 
+            backgroundColor: isActive ? theme.primaryContainer : 'transparent',
+            color: isActive ? theme.onPrimaryContainer : theme.onSurface,
+            contentVisibility: 'auto',
+            containIntrinsicSize: '0 72px' 
+        }}
+        >
+            <div className="w-12 h-12 rounded-lg flex items-center justify-center mr-4 shrink-0 overflow-hidden bg-cover bg-center border border-black/5" 
+                    style={{ 
+                        backgroundColor: isActive ? theme.primary : theme.surfaceVariant,
+                        backgroundImage: song.coverUrl ? `url(${song.coverUrl})` : 'none',
+                        color: isActive ? theme.onPrimary : theme.onSurfaceVariant
+                    }}>
+                {!song.coverUrl && (isActive ? (isPlaying ? <div className="w-3 h-3 bg-current rounded-sm animate-pulse"/> : <PlayIcon className="w-5 h-5"/>) : <MusicNoteIcon className="w-5 h-5 opacity-50"/>)}
+            </div>
+            <div className="min-w-0 flex-1">
+                <p className={`font-medium truncate ${isActive ? '' : 'text-base'}`}>{song.name}</p>
+                {song.artist && <p className="text-sm opacity-70 truncate">{song.artist}</p>}
+            </div>
+        </div>
+    );
+}, (prev, next) => {
+    return prev.song.id === next.song.id && 
+           prev.isActive === next.isActive && 
+           prev.isPlaying === next.isPlaying &&
+           prev.theme === next.theme;
+});
+
+
 const App: React.FC = () => {
-  // --- State ---
+  // --- State Initialization ---
+  const [isLoading, setIsLoading] = useState(true);
   const [songs, setSongs] = useState<Song[]>([]);
-  const [currentSongIndex, setCurrentSongIndex] = useState<number>(-1);
+  
+  // Load initial state from LocalStorage
+  const [currentSongIndex, setCurrentSongIndex] = useState<number>(() => {
+      const saved = localStorage.getItem('elysium_last_index');
+      return saved ? parseInt(saved, 10) : -1;
+  });
+  
+  const [mode, setMode] = useState<PlaybackMode>(() => {
+      const saved = localStorage.getItem('elysium_mode');
+      return (saved as PlaybackMode) || PlaybackMode.SEQUENCE;
+  });
+
+  const [themeColor, setThemeColor] = useState<string>(() => {
+     return localStorage.getItem('elysium_theme_color') || DEFAULT_THEME_COLOR;
+  });
+
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
+      const saved = localStorage.getItem('elysium_dark_mode');
+      return saved !== null ? JSON.parse(saved) : true;
+  });
+
+  const [language, setLanguage] = useState<'en' | 'zh'>(() => {
+      const saved = localStorage.getItem('elysium_language');
+      return (saved as 'en' | 'zh') || 'zh';
+  });
+
+  const [appSettings, setAppSettings] = useState<AppSettings>(() => {
+      const saved = localStorage.getItem('elysium_settings');
+      return saved ? JSON.parse(saved) : { pauseOnDisconnect: true, enableBlur: true };
+  });
+
+  // Runtime State
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [mode, setMode] = useState<PlaybackMode>(PlaybackMode.SEQUENCE);
   
+  // Shuffle Queue State
+  const [shuffledIndices, setShuffledIndices] = useState<number[]>([]);
+
   // UI State
   const [view, setView] = useState<ViewState>('main');
   const [isFullPlayerOpen, setIsFullPlayerOpen] = useState(false);
+  const [isImageViewerOpen, setIsImageViewerOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [dragTime, setDragTime] = useState(0);
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   
-  // Swipe Logic State
-  const [swipeOffset, setSwipeOffset] = useState(0);
-  const touchStartRef = useRef(0);
+  // Animation State
+  const [isAnimating, setIsAnimating] = useState(false); 
   
+  // Refs
+  const fullPlayerRef = useRef<HTMLDivElement>(null);
+  const albumArtContainerRef = useRef<HTMLDivElement>(null);
+  const prevCardRef = useRef<HTMLDivElement>(null);
+  const currentCardRef = useRef<HTMLDivElement>(null);
+  const nextCardRef = useRef<HTMLDivElement>(null);
+
+  const touchStartRef = useRef(0); 
+  const touchStartXRef = useRef(0); 
+  const currentTranslateY = useRef(0);
+  const currentTranslateX = useRef(0);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isSwitchingRef = useRef(false); 
+  
+  const pendingCarouselReset = useRef<'next' | 'prev' | null>(null);
+  const layoutResetNeededRef = useRef(false);
+
   // Search State
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Settings & History State
-  const [language, setLanguage] = useState<'en' | 'zh'>('zh');
   const [history, setHistory] = useState<PlaybackLog[]>([]);
-  const [appSettings, setAppSettings] = useState<AppSettings>({
-      pauseOnDisconnect: true,
-      enableBlur: true
-  });
-  
-  // Stats View State
   const [statRange, setStatRange] = useState<TimeRange>('day');
-  
-  // Theme State
-  const [themeColor, setThemeColor] = useState<string>(DEFAULT_THEME_COLOR);
-  const [isDarkMode, setIsDarkMode] = useState(true);
   const [theme, setTheme] = useState<ThemeColors>(generateDarkTheme(DEFAULT_THEME_COLOR));
 
-  // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastPlayStartRef = useRef<number>(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // --- Effects ---
+  // Derived State
+  const currentSong = songs[currentSongIndex];
+  const t = translations[language];
 
-  // Focus search input when opened
+  // --- Effects for Persistence ---
+  useEffect(() => localStorage.setItem('elysium_last_index', currentSongIndex.toString()), [currentSongIndex]);
+  useEffect(() => localStorage.setItem('elysium_mode', mode), [mode]);
+  useEffect(() => localStorage.setItem('elysium_theme_color', themeColor), [themeColor]);
+  useEffect(() => localStorage.setItem('elysium_dark_mode', JSON.stringify(isDarkMode)), [isDarkMode]);
+  useEffect(() => localStorage.setItem('elysium_language', language), [language]);
+  useEffect(() => localStorage.setItem('elysium_settings', JSON.stringify(appSettings)), [appSettings]);
+
+  // Load Songs from IndexedDB on Mount
+  useEffect(() => {
+    const init = async () => {
+        setIsLoading(true);
+        try {
+            const storedSongs = await loadSongsFromDB();
+            if (storedSongs.length > 0) {
+                setSongs(storedSongs);
+                // Background metadata check
+                setTimeout(() => {
+                    const checkMetadata = async () => {
+                        let needsParse = false;
+                        for(let i=0; i<Math.min(storedSongs.length, 5); i++) {
+                             if (!storedSongs[i].artist && storedSongs[i].name === storedSongs[i].file.name.replace(/\.[^/.]+$/, "")) {
+                                 needsParse = true;
+                                 break;
+                             }
+                        }
+                        if (needsParse) {
+                             processMetadataQueue(storedSongs, 0);
+                        }
+                    };
+                    checkMetadata();
+                }, 2000);
+            }
+        } catch (e) {
+            console.error("Error loading songs from DB", e);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+    init();
+  }, []);
+
+  // Metadata Parser Queue
+  const processMetadataQueue = useCallback(async (songsToProcess: Song[], startIndex: number = 0) => {
+        const batchSize = 5; 
+        const endIndex = Math.min(startIndex + batchSize, songsToProcess.length);
+        
+        for (let i = startIndex; i < endIndex; i++) {
+            const song = songsToProcess[i];
+            try {
+                if (song.artist && song.artist !== "Unknown Artist") continue;
+
+                const meta = await getMetadata(song.file);
+                if (meta.title || meta.artist || meta.picture) {
+                    const updatedSong = {
+                        ...song,
+                        name: meta.title || song.name,
+                        artist: meta.artist,
+                        coverUrl: meta.picture
+                    };
+                    setSongs(prev => prev.map(s => s.id === song.id ? updatedSong : s));
+                    await updateSongInDB(updatedSong);
+                }
+            } catch (e) {
+                console.warn(`Failed to parse metadata for ${song.name}`, e);
+            }
+        }
+        
+        if (endIndex < songsToProcess.length) {
+            setTimeout(() => processMetadataQueue(songsToProcess, endIndex), 500);
+        }
+  }, []);
+
+  // Shuffle Generator
+  useEffect(() => {
+    if (mode === PlaybackMode.SHUFFLE && songs.length > 0) {
+        const indices = Array.from({ length: songs.length }, (_, i) => i);
+        for (let i = indices.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [indices[i], indices[j]] = [indices[j], indices[i]];
+        }
+        setShuffledIndices(indices);
+    }
+  }, [mode, songs.length]);
+
+  // Detect Mobile
+  useEffect(() => {
+    const checkMobile = () => {
+      const userAgent = typeof window.navigator === "undefined" ? "" : navigator.userAgent;
+      const mobile = Boolean(userAgent.match(/Android|BlackBerry|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i));
+      setIsMobile(mobile);
+    };
+    checkMobile();
+  }, []);
+
+  // History Trap
+  useEffect(() => {
+      const pushTrap = () => {
+          window.history.pushState({ trap: true }, '', '');
+      };
+      pushTrap();
+
+      const handlePopState = (event: PopStateEvent) => {
+          let handled = false;
+          if (isImageViewerOpen) {
+              setIsImageViewerOpen(false);
+              handled = true;
+          } else if (isDetailsOpen) {
+              setIsDetailsOpen(false);
+              handled = true;
+          } else if (isFullPlayerOpen) {
+              setIsFullPlayerOpen(false);
+              handled = true;
+          } else if (view !== 'main') {
+              setView('main');
+              handled = true;
+          }
+
+          if (handled) {
+              pushTrap();
+          }
+      };
+
+      window.addEventListener('popstate', handlePopState);
+      return () => window.removeEventListener('popstate', handlePopState);
+  }, [isFullPlayerOpen, view, isDetailsOpen, isImageViewerOpen]);
+
+  // View Navigation Helpers
+  const navigateTo = (newView: ViewState) => setView(newView);
+  const openFullPlayer = () => setIsFullPlayerOpen(true);
+  const openImageViewer = () => setIsImageViewerOpen(true);
+  const closeFullPlayer = () => setIsFullPlayerOpen(false);
+  const closeView = () => setView('main');
+  const closeDetails = () => setIsDetailsOpen(false);
+
+  // Focus search
   useEffect(() => {
     if (isSearchOpen && searchInputRef.current) {
         searchInputRef.current.focus();
     }
   }, [isSearchOpen]);
 
-  // Load History
-  useEffect(() => {
-      setHistory(loadHistory());
-  }, []);
-
-  // Update theme
+  // Load History & Theme
+  useEffect(() => { setHistory(loadHistory()); }, []);
   useEffect(() => {
     const newTheme = isDarkMode ? generateDarkTheme(themeColor) : generateTheme(themeColor);
     setTheme(newTheme);
   }, [themeColor, isDarkMode]);
 
-  // Audio Events & Tracking logic
+  // Audio Logic
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -206,16 +519,29 @@ const App: React.FC = () => {
 
     const handlePlay = () => {
         lastPlayStartRef.current = Date.now();
+        setIsPlaying(true);
+        MediaSession.setPlaybackState({ playbackState: 'playing' });
+        MediaSession.setPositionState({
+            duration: audio.duration || 0,
+            playbackRate: audio.playbackRate,
+            position: audio.currentTime
+        });
     };
 
     const handlePause = () => {
         flushPlaySession();
         setIsPlaying(false);
+        MediaSession.setPlaybackState({ playbackState: 'paused' });
+         MediaSession.setPositionState({
+            duration: audio.duration || 0,
+            playbackRate: audio.playbackRate,
+            position: audio.currentTime
+        });
     };
 
     const handleEnded = () => {
         flushPlaySession();
-        handleNext(true); 
+        handleNextAnimated(true); 
     };
 
     const handleBeforeUnload = () => {
@@ -238,9 +564,8 @@ const App: React.FC = () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       if (lastPlayStartRef.current > 0) flushPlaySession(); 
     };
-  }, [currentSongIndex, mode, songs, isDragging]); 
+  }, [currentSongIndex, mode, songs, isDragging]);
 
-  // Sync isPlaying state to audio element
   useEffect(() => {
     if (currentSongIndex === -1 || !songs[currentSongIndex]) return;
     const audio = audioRef.current;
@@ -256,76 +581,93 @@ const App: React.FC = () => {
     }
   }, [isPlaying, currentSongIndex]);
 
-  // Device Disconnect
+  // Reset transforms when player state changes (Opening/Closing)
   useEffect(() => {
-      if (!appSettings.pauseOnDisconnect) return;
-      // @ts-ignore
-      const handleDeviceChange = () => { if (isPlaying) setIsPlaying(false); };
-      // @ts-ignore
-      if (navigator.mediaDevices && navigator.mediaDevices.ondevicechange !== undefined) {
-           // @ts-ignore
-           navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
-           return () => {
-               // @ts-ignore
-               navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
-           }
+      if (isFullPlayerOpen && fullPlayerRef.current) {
+          fullPlayerRef.current.style.transform = `translateY(0px)`;
+          currentTranslateY.current = 0;
+      } else if (!isFullPlayerOpen && fullPlayerRef.current) {
+          currentTranslateY.current = 0;
       }
-  }, [appSettings.pauseOnDisconnect, isPlaying]);
+      
+      if (albumArtContainerRef.current) {
+          albumArtContainerRef.current.style.transform = `translateX(0px)`;
+          currentTranslateX.current = 0;
+          
+          if (currentCardRef.current) currentCardRef.current.style.transform = 'scale(1)';
+          if (prevCardRef.current) prevCardRef.current.style.transform = 'scale(0.85)';
+          if (nextCardRef.current) nextCardRef.current.style.transform = 'scale(0.85)';
+      }
+  }, [isFullPlayerOpen]);
 
+  // Media Session
+  useEffect(() => {
+      if (currentSong) {
+          MediaSession.setMetadata({
+              title: currentSong.name,
+              artist: currentSong.artist || translations[language].unknown,
+              album: "Elysium",
+              artwork: currentSong.coverUrl ? [
+                  { src: currentSong.coverUrl, sizes: '512x512', type: 'image/png' },
+              ] : []
+          });
+      }
+      
+      const setHandlers = async () => {
+          await MediaSession.setActionHandler({ action: 'play' }, () => setIsPlaying(true));
+          await MediaSession.setActionHandler({ action: 'pause' }, () => setIsPlaying(false));
+          await MediaSession.setActionHandler({ action: 'previoustrack' }, handlePrevAnimated);
+          await MediaSession.setActionHandler({ action: 'nexttrack' }, () => handleNextAnimated(false));
+          await MediaSession.setActionHandler({ action: 'seekto' }, (details) => {
+              if (details.seekTime && audioRef.current) {
+                  audioRef.current.currentTime = details.seekTime;
+                  setCurrentTime(details.seekTime);
+                   MediaSession.setPositionState({
+                        duration: audioRef.current.duration || 0,
+                        playbackRate: audioRef.current.playbackRate,
+                        position: details.seekTime
+                    });
+              }
+          });
+      };
+      setHandlers();
+      MediaSession.setPlaybackState({ 
+          playbackState: isPlaying ? 'playing' : 'paused' 
+      });
 
-  // --- Handlers ---
+  }, [currentSongIndex, songs, mode, shuffledIndices, language]); 
 
-  const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files) return;
+  // Helpers
+  const currentShufflePos = useMemo(() => {
+    if (mode !== PlaybackMode.SHUFFLE) return -1;
+    return shuffledIndices.indexOf(currentSongIndex);
+  }, [mode, shuffledIndices, currentSongIndex]);
 
-    // 1. Basic Load
-    const rawFiles = (Array.from(files) as File[])
-      .filter(f => f.type.startsWith('audio/'))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    
-    if (rawFiles.length === 0) return;
+  const prevSongIndex = useMemo(() => {
+      if (songs.length === 0) return -1;
+      if (mode === PlaybackMode.SHUFFLE && currentShufflePos !== -1) {
+           const idx = (currentShufflePos - 1 + shuffledIndices.length) % shuffledIndices.length;
+           return shuffledIndices[idx];
+      }
+      return (currentSongIndex - 1 + songs.length) % songs.length;
+  }, [currentSongIndex, songs.length, mode, shuffledIndices, currentShufflePos]);
 
-    // Temporary array with basic info
-    const initialSongs: Song[] = rawFiles.map(file => ({
-        id: `${file.name}-${Date.now()}-${Math.random()}`,
-        file: file,
-        name: file.name.replace(/\.[^/.]+$/, ""),
-        url: URL.createObjectURL(file),
-    }));
+  const nextSongIndex = useMemo(() => {
+      if (songs.length === 0) return -1;
+      if (mode === PlaybackMode.SHUFFLE && currentShufflePos !== -1) {
+           const idx = (currentShufflePos + 1) % shuffledIndices.length;
+           return shuffledIndices[idx];
+      }
+      return (currentSongIndex + 1) % songs.length;
+  }, [currentSongIndex, songs.length, mode, shuffledIndices, currentShufflePos]);
 
-    setSongs(initialSongs);
-    setCurrentSongIndex(0);
-    // Don't auto-play on load
-    setIsPlaying(false); 
-    
-    // 2. Lazy Load Metadata (async)
-    for (let i = 0; i < initialSongs.length; i++) {
-        const metadata = await getMetadata(initialSongs[i].file);
-        if (metadata.title || metadata.artist || metadata.picture) {
-             setSongs(prev => {
-                 const newArr = [...prev];
-                 const idx = newArr.findIndex(s => s.id === initialSongs[i].id);
-                 if (idx !== -1) {
-                     newArr[idx] = {
-                         ...newArr[idx],
-                         name: metadata.title || newArr[idx].name,
-                         artist: metadata.artist,
-                         coverUrl: metadata.picture
-                     };
-                 }
-                 return newArr;
-             });
-        }
-        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
-    }
-  };
+  const prevSong = songs[prevSongIndex];
+  const nextSong = songs[nextSongIndex];
 
-  const handleNext = useCallback((auto = false) => {
-    setSongs(prevSongs => {
+  const changeIndex = useCallback((direction: 'next' | 'prev', auto = false) => {
       setCurrentSongIndex(prevIndex => {
-        if (prevSongs.length === 0) return -1;
-        
+        if (songs.length === 0) return -1;
+
         if (mode === PlaybackMode.REPEAT_ONE && auto) {
             if(audioRef.current) {
                 audioRef.current.currentTime = 0;
@@ -335,38 +677,152 @@ const App: React.FC = () => {
         }
 
         if (mode === PlaybackMode.SHUFFLE) {
-          const randomIndex = Math.floor(Math.random() * prevSongs.length);
-          return randomIndex;
+            const currentPos = shuffledIndices.indexOf(prevIndex);
+            if (currentPos === -1) {
+                 return Math.floor(Math.random() * songs.length);
+            }
+            let newPos;
+            if (direction === 'next') {
+                newPos = (currentPos + 1) % shuffledIndices.length;
+            } else {
+                newPos = (currentPos - 1 + shuffledIndices.length) % shuffledIndices.length;
+            }
+            return shuffledIndices[newPos];
         }
 
-        const nextIndex = prevIndex + 1;
-        if (nextIndex >= prevSongs.length) {
-          if (mode === PlaybackMode.SEQUENCE) {
-             setIsPlaying(false); 
-             return prevIndex;
-          }
-          return 0;
+        let newIndex = prevIndex;
+        if (direction === 'next') {
+            newIndex = prevIndex + 1;
+            if (newIndex >= songs.length) {
+                if (mode === PlaybackMode.SEQUENCE && auto) {
+                   setIsPlaying(false); 
+                   return prevIndex; 
+                }
+                newIndex = 0; 
+            }
+        } else {
+            newIndex = prevIndex - 1;
+            if (newIndex < 0) newIndex = songs.length - 1;
         }
-        return nextIndex;
+        return newIndex;
       });
-      return prevSongs;
-    });
-  }, [mode]);
+  }, [mode, shuffledIndices, songs]); 
 
-  const handlePrev = () => {
+  // --- No-Flash Carousel Logic (Sync Reset) ---
+
+  // Triggers AFTER React has updated the DOM with new song data
+  useLayoutEffect(() => {
+      if (layoutResetNeededRef.current && albumArtContainerRef.current) {
+          // 1. Instantly disable transition to prevent animation during reset
+          albumArtContainerRef.current.style.transition = 'none';
+          if(prevCardRef.current) prevCardRef.current.style.transition = 'none';
+          if(currentCardRef.current) currentCardRef.current.style.transition = 'none';
+          if(nextCardRef.current) nextCardRef.current.style.transition = 'none';
+
+          // 2. Reset Position to center (0px)
+          // Since React has just updated the data, Slot 2 (Center) now holds the "New Current Song"
+          // which is visually identical to the "Old Next/Prev Song" that was shifted into view.
+          albumArtContainerRef.current.style.transform = 'translateX(0px)';
+          
+          // 3. Reset Scales to resting state
+          if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(1)';
+          if(prevCardRef.current) prevCardRef.current.style.transform = 'scale(0.85)';
+          if(nextCardRef.current) nextCardRef.current.style.transform = 'scale(0.85)';
+
+          // 4. Force Browser Reflow to apply changes immediately
+          void albumArtContainerRef.current.offsetHeight;
+
+          // 5. Cleanup: Restore standard transition behavior for next interaction
+          albumArtContainerRef.current.style.transition = '';
+          if(prevCardRef.current) prevCardRef.current.style.transition = '';
+          if(currentCardRef.current) currentCardRef.current.style.transition = '';
+          if(nextCardRef.current) nextCardRef.current.style.transition = '';
+
+          // 6. Reset Internal State
+          currentTranslateX.current = 0;
+          layoutResetNeededRef.current = false;
+          pendingCarouselReset.current = null;
+          setIsAnimating(false);
+          isSwitchingRef.current = false;
+      }
+  }, [currentSongIndex]); // Dependency ensures this runs after render on index change
+
+  const onCarouselTransitionEnd = useCallback((e: React.TransitionEvent) => {
+      // Ensure we are catching the transform transition of the container
+      if (e.target !== albumArtContainerRef.current || e.propertyName !== 'transform') return;
+      
+      if (pendingCarouselReset.current) {
+          const direction = pendingCarouselReset.current;
+          // Mark that we are about to switch data, prompting useLayoutEffect to handle the visual reset
+          layoutResetNeededRef.current = true; 
+          changeIndex(direction, false); 
+      }
+  }, [changeIndex]);
+
+  const performSongChange = (direction: 'next' | 'prev', auto = false) => {
+      if (isSwitchingRef.current) return;
+      isSwitchingRef.current = true;
+      const containerWidth = albumArtContainerRef.current ? (albumArtContainerRef.current.clientWidth / 3) : (window.innerWidth || 360);
+
+      if (albumArtContainerRef.current) {
+          setIsAnimating(true); // Enable CSS transition class
+          pendingCarouselReset.current = direction; // Mark direction for transitionEnd handler
+          
+          // 1. Slide Track
+          const targetX = direction === 'next' ? -containerWidth : containerWidth;
+          albumArtContainerRef.current.style.transform = `translateX(${targetX}px)`;
+
+          // 2. Animate Scales Final Step
+          if (direction === 'next') {
+              if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(0.85)';
+              if(nextCardRef.current) nextCardRef.current.style.transform = 'scale(1)';
+          } else {
+              if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(0.85)';
+              if(prevCardRef.current) prevCardRef.current.style.transform = 'scale(1)';
+          }
+      }
+  };
+
+  const handleNextAnimated = (auto = false) => performSongChange('next', auto);
+  const handlePrevAnimated = () => {
     if (songs.length === 0) return;
     if (currentTime > 3) {
       if (audioRef.current) audioRef.current.currentTime = 0;
       return;
     }
-    if (mode === PlaybackMode.SHUFFLE) {
-       handleNext(); 
-       return;
-    }
-    setCurrentSongIndex(prev => {
-      const newIndex = prev - 1;
-      return newIndex < 0 ? songs.length - 1 : newIndex;
+    performSongChange('prev');
+  };
+
+  const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files) return;
+
+    const rawFiles = (Array.from(files) as File[])
+      .filter(f => f.type.startsWith('audio/'))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    
+    if (rawFiles.length === 0) return;
+
+    setIsLoading(true);
+
+    const initialSongs: Song[] = rawFiles.map(file => ({
+        id: `${file.name}-${Date.now()}-${Math.random()}`,
+        file: file,
+        name: file.name.replace(/\.[^/.]+$/, ""),
+        url: URL.createObjectURL(file),
+        coverUrl: undefined 
+    }));
+
+    setSongs(initialSongs);
+    setCurrentSongIndex(0);
+    setIsPlaying(false);
+    setIsLoading(false);
+
+    saveSongsToDB(initialSongs).catch(e => {
+        console.error("Failed to save to DB", e);
     });
+    
+    processMetadataQueue(initialSongs, 0);
   };
 
   const togglePlay = (e?: React.MouseEvent) => {
@@ -385,7 +841,6 @@ const App: React.FC = () => {
     setLanguage(prev => prev === 'en' ? 'zh' : 'en');
   };
 
-  // Dragging Handlers (Seekbar)
   const handleSeekStart = () => {
     setIsDragging(true);
   };
@@ -393,41 +848,197 @@ const App: React.FC = () => {
   const handleSeekMove = (e: React.ChangeEvent<HTMLInputElement>) => {
       const val = Number(e.target.value);
       setDragTime(val);
-      if (!isDragging) setIsDragging(true); // Safety
+      if (!isDragging) setIsDragging(true); 
   };
 
   const handleSeekEnd = (e: React.MouseEvent | React.TouchEvent) => {
       if (audioRef.current) {
           audioRef.current.currentTime = dragTime;
           setCurrentTime(dragTime);
+          
+          MediaSession.setPositionState({
+                duration: audioRef.current.duration || 0,
+                playbackRate: audioRef.current.playbackRate,
+                position: dragTime
+          });
       }
       setIsDragging(false);
   };
 
-  // Swipe Handlers (Full Player)
+  const startLongPress = () => {
+      if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = setTimeout(() => {
+          if(currentSong?.coverUrl) {
+            openImageViewer();
+          }
+      }, 600); 
+  };
+
+  const cancelLongPress = () => {
+      if (longPressTimerRef.current) {
+          clearTimeout(longPressTimerRef.current);
+          longPressTimerRef.current = null;
+      }
+  };
+
   const handleTouchStart = (e: React.TouchEvent) => {
+      if (isSwitchingRef.current) return;
+
+      if (fullPlayerRef.current) {
+          fullPlayerRef.current.style.transition = 'none';
+      }
+
       touchStartRef.current = e.touches[0].clientY;
+      touchStartXRef.current = e.touches[0].clientX;
+      
+      setIsAnimating(false);
+      startLongPress();
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
+      if (isSwitchingRef.current) return;
+
       const currentY = e.touches[0].clientY;
-      const diff = currentY - touchStartRef.current;
-      // Only allow dragging down
-      if (diff > 0) {
-          setSwipeOffset(diff);
+      const currentX = e.touches[0].clientX;
+      const diffY = currentY - touchStartRef.current;
+      const diffX = currentX - touchStartXRef.current;
+
+      if (Math.abs(diffX) > 10 || Math.abs(diffY) > 10) {
+          cancelLongPress();
+      }
+
+      if (Math.abs(diffY) > Math.abs(diffX)) {
+           if (diffY > 0) {
+               currentTranslateY.current = diffY;
+               if (fullPlayerRef.current) {
+                   fullPlayerRef.current.style.transform = `translateY(${diffY}px)`;
+               }
+               if (albumArtContainerRef.current && currentTranslateX.current !== 0) {
+                   currentTranslateX.current = 0;
+                   albumArtContainerRef.current.style.transform = `translateX(0px)`;
+                   if (currentCardRef.current) currentCardRef.current.style.transform = 'scale(1)';
+                   if (prevCardRef.current) prevCardRef.current.style.transform = 'scale(0.85)';
+                   if (nextCardRef.current) nextCardRef.current.style.transform = 'scale(0.85)';
+               }
+           }
+      } else {
+           const dampedX = diffX * 0.6;
+           const containerWidth = albumArtContainerRef.current ? (albumArtContainerRef.current.clientWidth / 3) : (window.innerWidth || 360);
+           
+           currentTranslateX.current = dampedX;
+           
+           if (albumArtContainerRef.current) {
+               albumArtContainerRef.current.style.transition = 'none'; 
+               albumArtContainerRef.current.style.transform = `translateX(${dampedX}px)`;
+           }
+
+           const ratio = Math.min(Math.abs(dampedX) / containerWidth, 1);
+           const centerScale = 1 - (0.15 * ratio);
+           
+           if (currentCardRef.current) {
+               currentCardRef.current.style.transition = 'none';
+               currentCardRef.current.style.transform = `scale(${centerScale})`;
+           }
+
+           if (dampedX < 0) {
+               const nextScale = 0.85 + (0.15 * ratio);
+               if (nextCardRef.current) {
+                   nextCardRef.current.style.transition = 'none';
+                   nextCardRef.current.style.transform = `scale(${nextScale})`;
+               }
+               if (prevCardRef.current) {
+                   prevCardRef.current.style.transition = 'none';
+                   prevCardRef.current.style.transform = 'scale(0.85)';
+               }
+           } else {
+               const prevScale = 0.85 + (0.15 * ratio);
+               if (prevCardRef.current) {
+                   prevCardRef.current.style.transition = 'none';
+                   prevCardRef.current.style.transform = `scale(${prevScale})`;
+               }
+               if (nextCardRef.current) {
+                   nextCardRef.current.style.transition = 'none';
+                   nextCardRef.current.style.transform = 'scale(0.85)';
+               }
+           }
+
+           if (fullPlayerRef.current && currentTranslateY.current !== 0) {
+               currentTranslateY.current = 0;
+               fullPlayerRef.current.style.transform = `translateY(0px)`;
+           }
       }
   };
 
-  const handleTouchEnd = () => {
-      const threshold = 150; // px to close
-      if (swipeOffset > threshold) {
-          setIsFullPlayerOpen(false);
+  const handleTouchEnd = (e: React.TouchEvent) => {
+      cancelLongPress();
+      if (isSwitchingRef.current) return;
+
+      if (fullPlayerRef.current) fullPlayerRef.current.style.transition = '';
+      if (albumArtContainerRef.current) albumArtContainerRef.current.style.transition = '';
+      if (currentCardRef.current) currentCardRef.current.style.transition = '';
+      if (prevCardRef.current) prevCardRef.current.style.transition = '';
+      if (nextCardRef.current) nextCardRef.current.style.transition = '';
+
+      const currentY = e.changedTouches[0].clientY;
+      const currentX = e.changedTouches[0].clientX;
+      const diffY = currentY - touchStartRef.current;
+      const diffX = currentX - touchStartXRef.current;
+      
+      const verticalThreshold = 150; 
+      const containerWidth = albumArtContainerRef.current ? (albumArtContainerRef.current.clientWidth / 3) : (window.innerWidth || 360);
+      const horizontalThreshold = containerWidth * 0.35; 
+
+      if (Math.abs(diffY) > Math.abs(diffX) && diffY > 0) {
+           if (diffY > verticalThreshold) {
+               setIsAnimating(true);
+               closeFullPlayer();
+               currentTranslateY.current = 0;
+           } else {
+               setIsAnimating(true);
+               if (fullPlayerRef.current) fullPlayerRef.current.style.transform = `translateY(0px)`;
+               currentTranslateY.current = 0;
+               setTimeout(() => setIsAnimating(false), 300);
+           }
+      } else {
+          // Horizontal Swipe Logic
+          if (Math.abs(diffX) > horizontalThreshold) {
+              const direction = diffX > 0 ? 'prev' : 'next';
+              const targetX = direction === 'next' ? -containerWidth : containerWidth;
+              
+              isSwitchingRef.current = true;
+              setIsAnimating(true);
+              
+              // Set pending reset for TransitionEnd logic
+              pendingCarouselReset.current = direction;
+
+              // Animate to target, this will trigger onTransitionEnd
+              if (albumArtContainerRef.current) {
+                  albumArtContainerRef.current.style.transform = `translateX(${targetX}px)`;
+              }
+              
+              if (direction === 'next') {
+                  if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(0.85)';
+                  if(nextCardRef.current) nextCardRef.current.style.transform = 'scale(1)';
+              } else {
+                  if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(0.85)';
+                  if(prevCardRef.current) prevCardRef.current.style.transform = 'scale(1)';
+              }
+          } else {
+              // Snap Back
+              setIsAnimating(true);
+              if (albumArtContainerRef.current) {
+                   albumArtContainerRef.current.style.transform = `translateX(0px)`;
+              }
+              if(currentCardRef.current) currentCardRef.current.style.transform = 'scale(1)';
+              if(prevCardRef.current) prevCardRef.current.style.transform = 'scale(0.85)';
+              if(nextCardRef.current) nextCardRef.current.style.transform = 'scale(0.85)';
+
+              currentTranslateX.current = 0;
+              setTimeout(() => setIsAnimating(false), 300);
+          }
       }
-      // Reset immediately to allow animation to clean up or snap back
-      setSwipeOffset(0);
   };
 
-  // Filter Songs
   const filteredSongs = useMemo(() => {
     if (!searchQuery) return songs;
     const lower = searchQuery.toLowerCase();
@@ -437,13 +1048,13 @@ const App: React.FC = () => {
     );
   }, [songs, searchQuery]);
 
-  const handlePlayFiltered = (song: Song) => {
+  const handlePlayFiltered = useCallback((song: Song) => {
       const idx = songs.findIndex(s => s.id === song.id);
       if (idx !== -1) {
           setCurrentSongIndex(idx);
           setIsPlaying(true);
       }
-  };
+  }, [songs]); 
 
   const formatFileSize = (bytes: number) => {
     if (bytes === 0) return '0 B';
@@ -471,37 +1082,34 @@ const App: React.FC = () => {
       }
   };
 
-  // --- Render Helpers ---
-
-  const currentSong = songs[currentSongIndex];
-  const t = translations[language];
-
-  // Styles
-  const appStyle = {
+  const appStyle = useMemo(() => ({
     backgroundColor: theme.background,
     color: theme.onSurface,
-  } as React.CSSProperties;
+  } as React.CSSProperties), [theme.background, theme.onSurface]);
 
-  const primaryStyle = { color: theme.primary } as React.CSSProperties;
-  const primaryContainerStyle = { backgroundColor: theme.primaryContainer, color: theme.onPrimaryContainer } as React.CSSProperties;
-  const surfaceVariantStyle = { backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant } as React.CSSProperties;
+  const primaryContainerStyle = useMemo(() => ({ 
+      backgroundColor: theme.primaryContainer, 
+      color: theme.onPrimaryContainer 
+  } as React.CSSProperties), [theme.primaryContainer, theme.onPrimaryContainer]);
+
+  const miniPlayerStyle = useMemo(() => ({ 
+        backgroundColor: appSettings.enableBlur 
+            ? hexToRgba(theme.surfaceVariant, 0.85) 
+            : theme.surfaceVariant,
+        backdropFilter: appSettings.enableBlur ? 'blur(20px)' : 'none',
+        WebkitBackdropFilter: appSettings.enableBlur ? 'blur(20px)' : 'none',
+        display: (songs.length === 0 && !isLoading) ? 'none' : 'block' 
+  }), [appSettings.enableBlur, theme.surfaceVariant, songs.length, isLoading]);
 
   return (
     <div className="h-screen w-full overflow-hidden select-none relative" style={appStyle}>
-      {/* Audio Element (Persistent) */}
-      <audio 
-        ref={audioRef} 
-        src={currentSong?.url} 
-      />
+      <audio ref={audioRef} src={currentSong?.url} />
 
-      {/* --- View Container (Stack) --- */}
       <div className="absolute inset-0 w-full h-full overflow-hidden">
-          
           {/* Main View */}
           <div 
             className={`absolute inset-0 flex flex-col transition-transform duration-300 ease-in-out ${view === 'main' ? 'translate-x-0' : view === 'settings' || view === 'stats' || view === 'info' ? '-translate-x-1/3 opacity-50' : ''}`}
           >
-              {/* Top Bar */}
               <div className="h-16 flex items-center justify-between px-4 z-10 shrink-0" style={{ backgroundColor: theme.surface }}>
                 {isSearchOpen ? (
                    <div className="flex-1 flex items-center gap-2">
@@ -540,7 +1148,7 @@ const App: React.FC = () => {
                                 <FolderOpenIcon />
                             </button>
                             <button 
-                                onClick={() => setView('settings')}
+                                onClick={() => navigateTo('settings')}
                                 className="p-2 rounded-full hover:brightness-110 active:scale-95 transition"
                                 style={{ color: theme.onSurfaceVariant }}
                             >
@@ -551,10 +1159,14 @@ const App: React.FC = () => {
                 )}
               </div>
 
-              {/* Main Content */}
               <div className="flex-1 overflow-hidden relative flex flex-col md:flex-row">
-                 {/* Empty State */}
-                {songs.length === 0 && (
+                {isLoading && (
+                     <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-50 bg-black/5 backdrop-blur-sm">
+                        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-current mb-4" style={{color: theme.primary}}></div>
+                        <p className="font-medium">{t.loading}</p>
+                     </div>
+                )}
+                {songs.length === 0 && !isLoading && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center opacity-70">
                         <div className="mb-4 p-6 rounded-3xl" style={primaryContainerStyle}>
                             <MusicNoteIcon className="w-16 h-16"/>
@@ -563,38 +1175,22 @@ const App: React.FC = () => {
                         <p className="text-sm mt-2 opacity-80">{t.hint}</p>
                     </div>
                 )}
-                {/* List */}
                 <div className={`flex-1 overflow-y-auto ${songs.length === 0 ? 'hidden' : ''} pb-32 md:pb-0`}>
                     <div className="p-4 space-y-1">
                          <div className="flex justify-between items-center mb-2 px-2 opacity-70 text-sm font-medium">
                             <span>{filteredSongs.length} {t.songs}</span>
                          </div>
                          {filteredSongs.map((song) => {
-                            const originalIndex = songs.findIndex(s => s.id === song.id);
-                            const isActive = originalIndex === currentSongIndex;
+                            const isActive = song.id === currentSong?.id;
                             return (
-                                <div
-                                key={song.id}
-                                onClick={() => handlePlayFiltered(song)}
-                                className={`flex items-center p-3 rounded-2xl cursor-pointer transition-colors duration-200 group`}
-                                style={{ 
-                                    backgroundColor: isActive ? theme.primaryContainer : 'transparent',
-                                    color: isActive ? theme.onPrimaryContainer : theme.onSurface
-                                }}
-                                >
-                                <div className="w-12 h-12 rounded-lg flex items-center justify-center mr-4 shrink-0 overflow-hidden bg-cover bg-center border border-black/5" 
-                                        style={{ 
-                                            backgroundColor: isActive ? theme.primary : theme.surfaceVariant,
-                                            backgroundImage: song.coverUrl ? `url(${song.coverUrl})` : 'none',
-                                            color: isActive ? theme.onPrimary : theme.onSurfaceVariant
-                                        }}>
-                                    {!song.coverUrl && (isActive ? (isPlaying ? <div className="w-3 h-3 bg-current rounded-sm animate-pulse"/> : <PlayIcon className="w-5 h-5"/>) : <MusicNoteIcon className="w-5 h-5 opacity-50"/>)}
-                                </div>
-                                <div className="min-w-0 flex-1">
-                                    <p className={`font-medium truncate ${isActive ? '' : 'text-base'}`}>{song.name}</p>
-                                    {song.artist && <p className="text-sm opacity-70 truncate">{song.artist}</p>}
-                                </div>
-                                </div>
+                                <SongListItem
+                                    key={song.id}
+                                    song={song}
+                                    isActive={isActive}
+                                    isPlaying={isPlaying}
+                                    theme={theme}
+                                    onClick={() => handlePlayFiltered(song)}
+                                />
                             );
                          })}
                     </div>
@@ -602,21 +1198,13 @@ const App: React.FC = () => {
               </div>
           </div>
 
-          {/* Settings View */}
-          <div 
-            className={`absolute inset-0 flex flex-col bg-white transition-transform duration-300 ease-in-out ${view === 'settings' ? 'translate-x-0' : 'translate-x-full'}`}
-            style={{ backgroundColor: theme.background }}
-          >
-             <div className="h-16 flex items-center px-4 gap-4 shrink-0" style={{ backgroundColor: theme.surface }}>
-                  <button onClick={() => setView('main')} className="p-2 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}><ArrowBackIcon /></button>
-                  <h1 className="text-xl font-medium" style={{color: theme.onSurface}}>{t.settings}</h1>
-             </div>
-             <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-32">
-                {/* ... (Settings content) ... */}
+          {/* Settings View with Swipe Back */}
+          <SlideOverPanel isOpen={view === 'settings'} onClose={closeView} title={t.settings} theme={theme} zIndex={40}>
+             <div className="p-4 space-y-6 pb-32">
                 <section>
                     <h2 className="text-sm font-medium mb-2 px-2" style={{color: theme.primary}}>{t.stats}</h2>
                     <div className="rounded-3xl overflow-hidden" style={{backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant}}>
-                        <div className="p-4 flex justify-between items-center active:bg-black/5 transition cursor-pointer" onClick={() => setView('stats')}>
+                        <div className="p-4 flex justify-between items-center active:bg-black/5 transition cursor-pointer" onClick={() => navigateTo('stats')}>
                                 <div className="flex items-center gap-3"><StatsIcon /><span className="text-base">{t.detailedStats}</span></div>
                                 <div className="opacity-50"><SkipNextIcon className="w-5 h-5"/></div>
                         </div>
@@ -632,7 +1220,7 @@ const App: React.FC = () => {
                         <div className="h-px w-full opacity-10" style={{backgroundColor: theme.onSurfaceVariant}}></div>
                         <div className="p-4 flex justify-between items-center cursor-pointer active:bg-black/5 transition" onClick={() => setAppSettings(prev => ({ ...prev, pauseOnDisconnect: !prev.pauseOnDisconnect }))}>
                                 <div className="flex flex-col gap-1"><span className="text-base font-medium">{t.pauseOnDisconnect}</span><span className="text-xs opacity-70">{t.pauseOnDisconnectHint}</span></div>
-                                <div className={`w-12 h-7 shrink-0 rounded-full relative transition-colors duration-200 border border-transparent ml-4`} style={{backgroundColor: appSettings.pauseOnDisconnect ? theme.primary : theme.outline}}>
+                                <div className={`w-12 h-7 shrink-0 rounded-full relative transition-colors duration-200 border border-transparent`} style={{backgroundColor: appSettings.pauseOnDisconnect ? theme.primary : theme.outline}}>
                                     <div className={`absolute top-1 w-5 h-5 rounded-full bg-white shadow-sm transition-all duration-200 ${appSettings.pauseOnDisconnect ? 'left-6' : 'left-1'}`} />
                                 </div>
                         </div>
@@ -656,7 +1244,7 @@ const App: React.FC = () => {
                         <div className="p-4">
                                 <div className="flex items-center gap-3 mb-4"><PaletteIcon /><span className="text-base">{t.themeColor}</span></div>
                                 <div className="flex flex-wrap gap-4 justify-start">
-                                    {[DEFAULT_THEME_COLOR, '#9C27B0', '#E91E63', '#F44336', '#FF9800', '#4CAF50', '#009688', '#2196F3', '#3F51B5', '#607D8B'].map(c => (
+                                    {[DEFAULT_THEME_COLOR, '#9C27B0', '#E91E63', '#FF80AB', '#F44336', '#00BCD4', '#FF9800', '#4CAF50', '#8BC34A', '#009688', '#2196F3', '#3F51B5', '#607D8B'].map(c => (
                                         <button key={c} className="w-10 h-10 rounded-full border-2 transition-all active:scale-90 flex items-center justify-center" style={{ backgroundColor: c, borderColor: themeColor === c ? theme.onSurface : 'transparent' }} onClick={() => setThemeColor(c)}>{themeColor === c && <div className="w-2 h-2 bg-white rounded-full shadow-sm" />}</button>
                                     ))}
                                 </div>
@@ -666,73 +1254,43 @@ const App: React.FC = () => {
                 <section>
                     <h2 className="text-sm font-medium mb-2 px-2" style={{color: theme.primary}}>{t.info}</h2>
                     <div className="rounded-3xl overflow-hidden" style={{backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant}}>
-                        <div className="p-4 flex justify-between items-center active:bg-black/5 transition cursor-pointer" onClick={() => setView('info')}>
+                        <div className="p-4 flex justify-between items-center active:bg-black/5 transition cursor-pointer" onClick={() => navigateTo('info')}>
                                 <div className="flex items-center gap-3"><InfoIcon /><span className="text-base">{t.aboutApp}</span></div>
                                 <div className="opacity-50"><SkipNextIcon className="w-5 h-5"/></div>
                         </div>
                     </div>
                 </section>
              </div>
-          </div>
+          </SlideOverPanel>
 
-          {/* Info View */}
-          <div 
-             className={`absolute inset-0 flex flex-col bg-white transition-transform duration-300 ease-in-out ${view === 'info' ? 'translate-x-0' : 'translate-x-full'}`}
-             style={{ backgroundColor: theme.background }}
-          >
-              <div className="h-16 flex items-center px-4 gap-4 shrink-0" style={{ backgroundColor: theme.surface }}>
-                  <button onClick={() => setView('settings')} className="p-2 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}><ArrowBackIcon /></button>
-                  <h1 className="text-xl font-medium" style={{color: theme.onSurface}}>{t.info}</h1>
-              </div>
-              <div className="flex-1 overflow-y-auto p-4 pb-32">
-                  <div className="flex flex-col items-center justify-center py-8">
+          {/* Info View with Swipe Back */}
+          <SlideOverPanel isOpen={view === 'info'} onClose={closeView} title={t.info} theme={theme} zIndex={42}>
+              <div className="p-4 pb-32">
+                   {/* Info Content */}
+                   <div className="flex flex-col items-center justify-center py-8">
                       <div className="w-24 h-24 rounded-3xl mb-4 flex items-center justify-center shadow-lg" style={{backgroundColor: theme.primaryContainer}}>
                            <MusicNoteIcon className="w-12 h-12" />
                       </div>
                       <h2 className="text-2xl font-bold mb-1">Elysium</h2>
                       <p className="opacity-60 text-sm">v0.1.0</p>
                   </div>
-
                   <div className="space-y-4">
                       <div className="rounded-3xl overflow-hidden p-5 space-y-4" style={{backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant}}>
-                          <div className="flex flex-col gap-1">
-                              <span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.developer}</span>
-                              <span className="text-lg font-medium">midway2333</span>
-                          </div>
-                          <div className="flex flex-col gap-1">
-                              <span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.basedOn}</span>
-                              <span className="text-lg font-medium">Gemini 3 vibe coding</span>
-                          </div>
+                          <div className="flex flex-col gap-1"><span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.developer}</span><span className="text-lg font-medium">midway2333</span></div>
+                          <div className="flex flex-col gap-1"><span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.basedOn}</span><span className="text-lg font-medium">Gemini 3 vibe coding</span></div>
                       </div>
-
                       <div className="rounded-3xl overflow-hidden p-1 space-y-1" style={{backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant}}>
-                           <div className="px-4 py-2 mt-2">
-                                <span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.links}</span>
-                           </div>
-                           <a href="https://space.bilibili.com/400980240" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 hover:bg-black/5 rounded-2xl transition">
-                                <span className="font-medium">Bilibili</span>
-                                <SkipNextIcon className="opacity-50 w-5 h-5"/>
-                           </a>
-                           <a href="https://github.com/midway2333/Elysium" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 hover:bg-black/5 rounded-2xl transition">
-                                <span className="font-medium">GitHub</span>
-                                <SkipNextIcon className="opacity-50 w-5 h-5"/>
-                           </a>
+                           <div className="px-4 py-2 mt-2"><span className="text-xs font-bold uppercase opacity-50 tracking-wider" style={{color: theme.primary}}>{t.links}</span></div>
+                           <a href="https://space.bilibili.com/400980240" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 hover:bg-black/5 rounded-2xl transition"><span className="font-medium">Bilibili</span><SkipNextIcon className="opacity-50 w-5 h-5"/></a>
+                           <a href="https://github.com/midway2333/Elysium" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 hover:bg-black/5 rounded-2xl transition"><span className="font-medium">GitHub</span><SkipNextIcon className="opacity-50 w-5 h-5"/></a>
                       </div>
                   </div>
               </div>
-          </div>
+          </SlideOverPanel>
 
-          {/* Stats View */}
-          <div 
-             className={`absolute inset-0 flex flex-col bg-white transition-transform duration-300 ease-in-out ${view === 'stats' ? 'translate-x-0' : 'translate-x-full'}`}
-             style={{ backgroundColor: theme.background }}
-          >
-              <div className="h-16 flex items-center px-4 gap-4 shrink-0" style={{ backgroundColor: theme.surface }}>
-                  <button onClick={() => setView('settings')} className="p-2 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}><ArrowBackIcon /></button>
-                  <h1 className="text-xl font-medium" style={{color: theme.onSurface}}>{t.stats}</h1>
-              </div>
-              <div className="flex-1 overflow-y-auto p-4 pb-32">
-                 {/* ... (Stats content same as before) ... */}
+          {/* Stats View with Swipe Back */}
+          <SlideOverPanel isOpen={view === 'stats'} onClose={closeView} title={t.stats} theme={theme} zIndex={42}>
+              <div className="p-4 pb-32">
                  {(() => {
                       const stats = calculateStats(filterLogsByRange(history, statRange));
                       const ranges: {id: TimeRange, label: string}[] = [
@@ -746,6 +1304,7 @@ const App: React.FC = () => {
                                     <button key={r.id} onClick={() => setStatRange(r.id)} className={`px-4 py-2 rounded-full text-sm font-medium transition whitespace-nowrap`} style={{backgroundColor: statRange === r.id ? theme.primary : theme.surfaceVariant, color: statRange === r.id ? theme.onPrimary : theme.onSurfaceVariant}}>{r.label}</button>
                                 ))}
                             </div>
+                            {/* ... stats display ... */}
                             {stats.totalTime > 0 ? (
                                 <div className="space-y-6">
                                     <div className="space-y-4">
@@ -759,15 +1318,6 @@ const App: React.FC = () => {
                                                 <div className="flex justify-between items-center">
                                                     <div className="min-w-0"><div className="text-lg font-bold truncate">{stats.topSong.name}</div><div className="text-sm opacity-80 truncate">{stats.topSong.artist}</div></div>
                                                     <div className="text-right shrink-0 ml-4"><div className="font-mono font-medium">{formatDuration(stats.topSong.time, true)}</div><div className="text-xs opacity-60">{stats.topSong.count} plays</div></div>
-                                                </div>
-                                            </div>
-                                        )}
-                                        {stats.topArtist && (
-                                            <div className="p-4 rounded-3xl" style={{backgroundColor: theme.surfaceVariant, color: theme.onSurfaceVariant}}>
-                                                <div className="flex items-center gap-3 mb-3 opacity-70"><StatsIcon /><span className="text-sm font-bold uppercase">{t.topArtist}</span></div>
-                                                <div className="flex justify-between items-center">
-                                                    <div className="min-w-0"><div className="text-lg font-bold truncate">{stats.topArtist.name}</div></div>
-                                                    <div className="text-right shrink-0 ml-4"><div className="font-mono font-medium">{formatDuration(stats.topArtist.time, true)}</div><div className="text-xs opacity-60">{stats.topArtist.count} plays</div></div>
                                                 </div>
                                             </div>
                                         )}
@@ -815,22 +1365,14 @@ const App: React.FC = () => {
                       )
                  })()}
               </div>
-          </div>
+          </SlideOverPanel>
       </div>
 
       {/* --- Mini Player (Bottom Bar) --- */}
       <div 
         className={`absolute bottom-0 left-0 right-0 z-20 rounded-t-3xl shadow-[0_-4px_20px_rgba(0,0,0,0.1)] transition-all duration-300 overflow-hidden ${isFullPlayerOpen ? 'translate-y-full' : 'translate-y-0'}`}
-        style={{ 
-            // Changed: Use theme color with opacity for tinting, enabling content behind to be seen
-            backgroundColor: appSettings.enableBlur 
-                ? theme.surfaceVariant.replace('rgb', 'rgba').replace(')', ', 0.5)') 
-                : theme.surfaceVariant,
-            backdropFilter: appSettings.enableBlur ? 'blur(16px)' : 'none',
-            WebkitBackdropFilter: appSettings.enableBlur ? 'blur(16px)' : 'none', // Safari support
-            display: songs.length === 0 ? 'none' : 'block' 
-        }}
-        onClick={() => setIsFullPlayerOpen(true)}
+        style={miniPlayerStyle}
+        onClick={openFullPlayer}
       >
         <div className="px-4 py-3 flex items-center justify-between gap-4 relative z-10">
              <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -862,11 +1404,13 @@ const App: React.FC = () => {
 
       {/* --- Full Screen Player Overlay --- */}
       <div 
-         className={`absolute inset-0 z-30 flex flex-col cubic-bezier(0.2, 0.0, 0, 1.0) overflow-hidden ${swipeOffset === 0 ? 'transition-transform duration-500' : ''}`}
+         ref={fullPlayerRef}
+         className={`absolute inset-0 z-30 flex flex-col cubic-bezier(0.2, 0.0, 0, 1.0) overflow-hidden ${!isAnimating ? 'transition-transform duration-500' : 'transition-transform duration-300'}`}
          style={{ 
             backgroundColor: theme.surfaceVariant, 
             height: '100dvh',
-            transform: isFullPlayerOpen ? `translateY(${swipeOffset}px)` : 'translateY(100%)'
+            transform: isFullPlayerOpen ? `translateY(0px)` : 'translateY(100%)',
+            willChange: 'transform' // GPU Hint
          }}
          onTouchStart={handleTouchStart}
          onTouchMove={handleTouchMove}
@@ -885,24 +1429,80 @@ const App: React.FC = () => {
 
           {/* Header */}
           <div className="pt-8 pb-4 px-6 flex items-center justify-between shrink-0 relative z-10">
-               <button onClick={() => setIsFullPlayerOpen(false)} className="p-2 rounded-full active:bg-black/10 transition" style={{color: theme.onSurfaceVariant}}>
+               <button onClick={closeFullPlayer} className="p-2 rounded-full active:bg-black/10 transition" style={{color: theme.onSurfaceVariant}}>
                    <ChevronDownIcon />
                </button>
                <span className="text-xs font-bold tracking-widest uppercase opacity-50" style={{color: theme.onSurfaceVariant}}>Now Playing</span>
-               <button onClick={() => {setIsFullPlayerOpen(false); setView('settings');}} className="p-2 rounded-full active:bg-black/10 transition" style={{color: theme.onSurfaceVariant}}>
+               <button onClick={() => { closeFullPlayer(); setTimeout(() => navigateTo('settings'), 300); }} className="p-2 rounded-full active:bg-black/10 transition" style={{color: theme.onSurfaceVariant}}>
                    <SettingsIcon />
                </button>
           </div>
 
           {/* Main Body (Flexibly Shrinkable) */}
           <div className="flex-1 flex flex-col items-center justify-center p-8 gap-8 relative z-10 min-h-0 overflow-hidden">
-               {/* Big Cover Art */}
-               <div className="w-full h-auto aspect-square max-h-[40vh] max-w-sm rounded-[2rem] shadow-2xl overflow-hidden bg-cover bg-center border border-black/5 relative shrink-1"
-                    style={{ 
-                        backgroundColor: theme.surface,
-                        backgroundImage: currentSong?.coverUrl ? `url(${currentSong.coverUrl})` : 'none'
-                    }}>
-                    {!currentSong?.coverUrl && <div className="absolute inset-0 flex items-center justify-center"><MusicNoteIcon className="w-32 h-32 opacity-10"/></div>}
+               {/* Album Art Slider */}
+               <div className="w-full aspect-square max-h-[40vh] max-w-sm relative z-20" 
+                    style={{ }}> 
+                    {/* The sliding track. Width is 300% to hold 3 items. marginLeft -100% to center the middle item. */}
+                    <div 
+                         ref={albumArtContainerRef}
+                         className={`flex h-full w-[300%] -ml-[100%] flex-row ${isAnimating ? 'transition-transform duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)]' : ''}`}
+                         style={{ 
+                            touchAction: 'none', 
+                            willChange: 'transform',
+                            transform: 'translateX(0px)' 
+                         }}
+                         onTransitionEnd={onCarouselTransitionEnd}
+                         onContextMenu={(e) => e.preventDefault()}
+                    >
+                        {/* Prev Song */}
+                         <div className="flex-1 h-full flex items-center justify-center p-4 transition-all duration-300"
+                              ref={prevCardRef}
+                              style={{ 
+                                  transform: 'scale(0.85)',
+                              }}>
+                              <div className="w-full aspect-square rounded-[2rem] shadow-2xl border border-black/5 relative overflow-hidden bg-black/5" 
+                                   style={{ backgroundColor: theme.surface }}>
+                                   {prevSong?.coverUrl ? (
+                                       <img src={prevSong.coverUrl} className="w-full h-full object-cover pointer-events-none select-none block" draggable={false} alt="" />
+                                   ) : (
+                                       <div className="absolute inset-0 flex items-center justify-center"><MusicNoteIcon className="w-32 h-32 opacity-10"/></div>
+                                   )}
+                              </div>
+                         </div>
+
+                        {/* Current Song */}
+                         <div className="flex-1 h-full flex items-center justify-center p-0 relative z-10 transition-all duration-300"
+                              ref={currentCardRef}
+                              style={{ 
+                                  transform: 'scale(1)',
+                              }}>
+                              <div className="w-full aspect-square rounded-[2rem] shadow-2xl border border-black/5 relative overflow-hidden bg-black/5" 
+                                   style={{ backgroundColor: theme.surface }}>
+                                   {currentSong?.coverUrl ? (
+                                       <img src={currentSong.coverUrl} className="w-full h-full object-cover pointer-events-none select-none block" draggable={false} alt="" />
+                                   ) : (
+                                       <div className="absolute inset-0 flex items-center justify-center"><MusicNoteIcon className="w-32 h-32 opacity-10"/></div>
+                                   )}
+                              </div>
+                         </div>
+
+                        {/* Next Song */}
+                         <div className="flex-1 h-full flex items-center justify-center p-4 transition-all duration-300"
+                              ref={nextCardRef}
+                              style={{ 
+                                  transform: 'scale(0.85)',
+                              }}>
+                              <div className="w-full aspect-square rounded-[2rem] shadow-2xl border border-black/5 relative overflow-hidden bg-black/5" 
+                                   style={{ backgroundColor: theme.surface }}>
+                                   {nextSong?.coverUrl ? (
+                                       <img src={nextSong.coverUrl} className="w-full h-full object-cover pointer-events-none select-none block" draggable={false} alt="" />
+                                   ) : (
+                                       <div className="absolute inset-0 flex items-center justify-center"><MusicNoteIcon className="w-32 h-32 opacity-10"/></div>
+                                   )}
+                              </div>
+                         </div>
+                    </div>
                </div>
 
                {/* Song Info */}
@@ -955,13 +1555,13 @@ const App: React.FC = () => {
                     </button>
 
                     <div className="flex items-center gap-6">
-                        <button onClick={handlePrev} className="p-4 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}>
+                        <button onClick={handlePrevAnimated} className="p-4 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}>
                             <SkipPrevIcon className="w-8 h-8"/>
                         </button>
                         <button onClick={togglePlay} className="p-6 rounded-[24px] shadow-lg active:scale-95 transition hover:shadow-xl hover:brightness-110" style={{backgroundColor: theme.primary, color: theme.onPrimary}}>
                              {isPlaying ? <PauseIcon className="w-10 h-10"/> : <PlayIcon className="w-10 h-10"/>}
                         </button>
-                        <button onClick={() => handleNext()} className="p-4 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}>
+                        <button onClick={() => handleNextAnimated(false)} className="p-4 rounded-full hover:bg-black/5 active:scale-95 transition" style={{color: theme.onSurface}}>
                             <SkipNextIcon className="w-8 h-8"/>
                         </button>
                     </div>
@@ -999,7 +1599,7 @@ const App: React.FC = () => {
                     <div className="w-full max-w-sm rounded-3xl p-6 shadow-2xl relative" style={{backgroundColor: theme.surface, color: theme.onSurface}} onClick={e => e.stopPropagation()}>
                         <div className="flex justify-between items-center mb-6">
                              <h3 className="text-lg font-bold">{t.fileInfo}</h3>
-                             <button onClick={() => setIsDetailsOpen(false)} className="p-2 -mr-2 rounded-full hover:bg-black/5 flex items-center justify-center"><CloseIcon /></button>
+                             <button onClick={closeDetails} className="p-2 -mr-2 rounded-full hover:bg-black/5 flex items-center justify-center"><CloseIcon /></button>
                         </div>
                         <div className="space-y-4 text-sm">
                             <div className="flex justify-between py-2 border-b border-black/5">
@@ -1022,9 +1622,25 @@ const App: React.FC = () => {
                     </div>
                 </div>
            )}
+
+           {/* Image Viewer Modal */}
+           {isImageViewerOpen && currentSong?.coverUrl && (
+                <div 
+                    className="absolute inset-0 z-[60] flex items-center justify-center bg-black/90 backdrop-blur-md animate-in fade-in duration-200"
+                    onClick={() => setIsImageViewerOpen(false)}
+                >
+                    <img 
+                        src={currentSong.coverUrl} 
+                        alt="Full Album Art"
+                        className="max-w-full max-h-full object-contain p-4 shadow-2xl scale-in-95 animate-in duration-300"
+                    />
+                    <button className="absolute top-4 right-4 p-3 rounded-full bg-black/50 text-white" onClick={() => setIsImageViewerOpen(false)}>
+                        <CloseIcon />
+                    </button>
+                </div>
+           )}
       </div>
 
-      {/* Hidden File Input */}
       <input
         type="file"
         ref={fileInputRef}
@@ -1033,8 +1649,7 @@ const App: React.FC = () => {
         multiple
         accept="audio/*"
         // @ts-ignore
-        webkitdirectory="" 
-        directory=""
+        {...(!isMobile ? { webkitdirectory: "", directory: "" } : {})}
       />
     </div>
   );

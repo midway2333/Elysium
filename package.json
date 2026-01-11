@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "react-dom": "^19.2.3",
-    "react": "^19.2.3"
+    "react": "^19.2.3",
+    "@jofr/capacitor-media-session": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
